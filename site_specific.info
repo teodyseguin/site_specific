@@ -1,0 +1,4 @@
+name = Site Specific
+description = Provide Specific Functionality for Site
+package = Site Custom
+core = 7.x

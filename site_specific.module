@@ -1,0 +1,809 @@
+<?php
+
+/**
+ * @file
+ * site_specific.module
+ */
+
+/**
+ * Implements hook_menu().
+ */
+function site_specific_menu() {
+  $items = [];
+
+  $items['admin/site'] = [
+    'title' => 'site Configurations',
+    'description' => 'Specific Custom Configurations for site',
+    'page callback' => 'drupal_get_form',
+    'page arguments' => ['site_specific_admin'],
+    'access arguments' => ['administer site configurations'],
+    'type' => MENU_NORMAL_ITEM,
+    'file' => 'site_specific.admin.inc',
+  ];
+
+  return $items;
+}
+
+/**
+ * Implements hook_permission().
+ */
+function site_specific_permission() {
+  return [
+    'administer site configurations' => [
+      'title' => t('Administer site Configurations'),
+      'description' => t('Custom configurations for site'),
+    ],
+  ];
+}
+
+/**
+ * Implements hook_cronapi().
+ */
+function site_specific_cronapi($op, $job = NULL) {
+  // run this every 1 hour
+  $items['site_specific_check_order_status'] = [
+    'description' => 'Check the order status via scanning the UNFI FTP server account',
+    'rule' => '0 * * * *',
+    'callback' => 'site_specific_check_order_status_callback',
+  ];
+
+  return $items;
+}
+
+/**
+ * Custom callback function for checking order status from UNFI FTP server.
+ * Orders status are updated based on the present details found from the FTP.
+ */
+function site_specific_check_order_status_callback() {
+  $query = db_query("SELECT order_id FROM commerce_order WHERE status IN('pending', 'processing')");
+
+  if (!$query->rowCount()) {
+    return;
+  }
+
+  $orders = [];
+
+  foreach ($query as $row) {
+    $orders[] = commerce_order_load($row->order_id);
+  }
+
+  $ftp_server = variable_get('unfi_ftp_settings_host', '');
+  $username = variable_get('unfi_ftp_settings_username', '');
+  $password = variable_get('unfi_ftp_settings_password');
+  $ftp_conn = ftp_connect($ftp_server);
+
+  if ($ftp_conn) {
+    $login = ftp_login($ftp_conn, $username, $password);
+    ftp_pasv($ftp_conn, TRUE);
+    flog_it('[site_specific]: Connected to UNFI FTP server.');
+
+    $contents = ftp_nlist($ftp_conn, ".");
+
+    foreach ($contents as $content) {
+      switch ($content) {
+        case 'Confirmations':
+          site_specific_check_order_for_processing($ftp_conn, $content, $orders, $username);
+
+          break;
+
+        case 'Shipping':
+          site_specific_check_order_for_shipping($ftp_conn, $content, $orders, $username);
+
+          break;
+
+        case 'Tracking':
+          site_specific_check_order_for_tracking($ftp_conn, $content, $orders, $username);
+
+          break;
+      }
+    }
+  }
+  else {
+    flog_it('[site_specific]: Unable to connect in UNFI FTP server.');
+    return;
+  }
+}
+
+/**
+ * Implements hook_entity_insert().
+ */
+function site_specific_entity_insert($entity, $type) {
+  if ($type == 'user') {
+    site_specific_send_welcome_email($entity);
+  }
+}
+
+/**
+ * Implements hook_theme().
+ */
+function site_specific_theme() {
+  return [
+    'site_order_mail_body' => [
+      'template' => 'site-order-mail-body',
+      'path' => drupal_get_path('module', 'site_specific') . '/templates',
+      'variables' => [],
+    ],
+    'site_password_reset_mail_body' => [
+      'template' => 'site-password-reset-mail-body',
+      'path' => drupal_get_path('module', 'site_specific') . '/templates',
+      'variables' => [],
+    ],
+    'site_welcome_mail_body' => [
+      'template' => 'site-welcome-mail-body',
+      'path' => drupal_get_path('module', 'site_specific') . '/templates',
+      'variables' => [],
+    ],
+    'site_order_status_mail_body' => [
+      'template' => 'site-order-status-mail-body',
+      'path' => drupal_get_path('module', 'site_specific') . '/templates',
+      'variables' => [],
+    ],
+  ];
+}
+
+/**
+ * Implements hook_mail_alter().
+ */
+function site_specific_mail_alter(&$message) {
+  global $base_url;
+
+  $header_img_path = $base_url . '/' . drupal_get_path('module','site_specific') . '/images/email-header.png';
+  $footer_img_path = $base_url . '/' . drupal_get_path('module', 'site_specific') . '/images/email-footer.png';
+  $footer2_img_path = $base_url . '/' . drupal_get_path('module', 'site_specific') . '/images/email-footer-fence.png';
+  $header = "<img src='$header_img_path' width='100%' /><br />";
+  $footer = "<br /><img src='$footer_img_path' width='100%' />";
+  $footer2 = "<br /><img src='$footer2_img_path' width='100%' />";
+  $message['headers']['Content-Type'] = 'text/html; charset=UTF-8; format=flowed';
+
+  if ($message['key'] == 'site_order') {
+    $message['subject'] = $message['params']['subject'];
+    $message['body'][0] = '<div style="width: 525px; margin: 0 auto;">' .
+                            $header .
+                            '<div style="width: 100%; margin: 0 auto;">' .
+                              $message['params']['body'] .
+                            '</div>' .
+                            $footer .
+                          '</div>';
+  }
+  elseif ($message['key'] == 'site_welcome_user') {
+    $message['subject'] = $message['params']['subject'];
+    $message['body'][0] = '<div style="width: 525px; margin: 0 auto;">' .
+                            $header .
+                            '<div style="width: 100%; margin: 0 auto;">' .
+                              $message['params']['body'] .
+                            '</div>' .
+                            $footer2 .
+                          '</div>';
+  }
+  elseif ($message['key'] == 'password_reset') {
+    $account = $message['params']['account'];
+    $new_random_password = site_specific_update_account_password($account);
+    $body = theme('site_password_reset_mail_body', ['account' => $account, 'new_random_password' => $new_random_password]);
+    $message['body'][0] = '<div style="width: 525px; margin: 0 auto;">' .
+                          $header .
+                          '<div style="width: 100%; margin: 0 auto;">' .
+                            $body .
+                          '</div>' .
+                          $footer2 .
+                        '</div>';
+  }
+  else {
+    $original_body = $message['body'][0];
+    $message['body'][0] = '<div style="width: 525px; margin: 0 auto;">' .
+                          $header .
+                          '<div style="width: 100%; margin: 0 auto;">' .
+                            $original_body .
+                          '</div>' .
+                          $footer2 .
+                        '</div>';
+  }
+}
+
+/**
+ * Extract all line items that are of type product;
+ * 
+ * @param $line_items
+ *  An array of line items.
+ */
+function site_specific_get_line_items($type, $line_items) {
+  global $base_url;
+  $ln = LANGUAGE_NONE;
+
+  if (!count($line_items)) {
+    return;
+  }
+
+  $items = [];
+  $subtotal = 0;
+
+  foreach ($line_items as $key => $line_item) {
+    $item = commerce_line_item_load($line_item['line_item_id']);
+
+    if ($item->type == $type && $type == 'product') {
+      $product_id = $item->commerce_product[$ln][0]['product_id'];
+      $product = commerce_product_load($product_id);
+      $product_vars = get_object_vars($product);
+
+      foreach ($product_vars as $field => $value) {
+        $image_pos = strpos($field, 'image_1');
+        $unfi_pos = strpos($field, 'unfi_');
+
+        if ($image_pos !== FALSE) {
+          $image_link = $product->{$field}[$ln][0]['value'];
+        }
+
+        if ($unfi_pos !== FALSE) {
+          $unfi = $product->{$field}[$ln][0]['value'];
+        }
+      }
+
+      $title = $product->title;
+      $product_id = $product->product_id;
+      $quantity = $item->quantity;
+      $price = $item->commerce_unit_price[$ln][0]['amount'];
+      $price_formatted = commerce_currency_format($price, 'USD');
+      $details = str_replace('backoffice', '', $base_url) . 'product/' . $product_id;
+      $subtotal += $price * $quantity;
+
+      $items[] = [
+        'unfi' => $unfi,
+        'name' => $title,
+        'details' => $details,
+        'quantity' => $quantity,
+        'price' => $price_formatted,
+        'image_link' => $image_link,
+      ];
+    }
+    elseif ($item->type == $type && $type == 'custom_shipping') {
+      $items[] = [
+        'shipping' => commerce_currency_format($item->commerce_unit_price[$ln][0]['amount'], 'USD'),
+      ];
+    }
+    elseif ($item->type == $type && $type == 'custom_tax') {
+      $items[] = [
+        'tax' => commerce_currency_format($item->commerce_unit_price[$ln][0]['amount'], 'USD'),
+      ];
+    }
+  }
+
+  $items['subtotal'] = commerce_currency_format($subtotal, 'USD');
+  return $items;
+}
+
+/**
+ * Get the customer information.
+ * 
+ * @param $order
+ *  The order object.
+ */
+function site_specific_get_customer_information($order) {
+  $ln = LANGUAGE_NONE;
+
+  if (!empty($order->commerce_customer_shipping[$ln]) || !empty($order->commerce_customer_billing[$ln])) {
+    if (!empty($order->commerce_customer_shipping[$ln][0]['profile_id'])) {
+      $entity_id = $order->commerce_customer_shipping[$ln][0]['profile_id'];
+    }
+    else {
+      $entity_id = $order->commerce_customer_billing[$ln][0]['profile_id'];
+    }
+
+    $profile = db_query("SELECT * FROM field_data_commerce_customer_address WHERE entity_id = :entity_id", [
+      ':entity_id' => $entity_id
+    ])->fetchObject();
+
+    return [
+      'city' => $profile->commerce_customer_address_locality,
+      'postal_code' => $profile->commerce_customer_address_postal_code,
+      'address1' => $profile->commerce_customer_address_thoroughfare,
+      'address2' => $profile->commerce_customer_address_premise,
+      'country' => $profile->commerce_customer_address_country,
+      'first_name' => $profile->commerce_customer_address_first_name,
+      'last_name' => $profile->commerce_customer_address_last_name,
+    ];
+  }
+}
+
+/**
+ * Send a welcome email to user who signup to the site.
+ */
+function site_specific_send_welcome_email($entity) {
+  global $base_url;
+
+  $name = $entity->name;
+  $to = $entity->mail;
+  $subject = "Welcome to site $name";
+  $images_path = $base_url . '/' . drupal_get_path('module', 'site_specific') . '/images';
+  $domain_path = 'https://www.site.com';
+  $body = theme('site_welcome_mail_body', [
+    'images_path' => $images_path,
+    'domain_path' => $domain_path
+  ]);
+
+  $params = [
+    'subject' => $subject,
+    'body' => $body
+  ];
+
+  drupal_mail('site_specific', 'site_welcome_user', $to, language_default(), $params);
+}
+
+/**
+ * Prepare the body of the order email by extracting
+ * all the products from the given argument.
+ * 
+ * @param $products
+ *  An array of project objects.
+ * @param $shipping
+ *  Contains the shipping in index 0.
+ * @param $tax
+ *  Contains the tax in index 0.
+ * @param $order
+ *  The order object.
+ */
+function site_specific_send_confirmation_email_to_customer($products, $shipping, $tax, $order) {
+  $ln = LANGUAGE_NONE;
+
+  if (variable_get('environment_mode', '') == 'local') {
+    return;
+  }
+
+  $customer = site_specific_get_customer_information($order);
+  $name = $customer['first_name'] . ' ' . $customer['last_name'];
+  $address1 = $customer['address1'];
+  $address2 = $customer['address2'];
+  $city = $customer['city'];
+  $country = $customer['country'];
+  $postal_code = $customer['postal_code'];
+
+  $title = "Thank you for your purchase.";
+  $salutation = "Dear ($name)";
+  $message1 = "Your order has been received and is now being processed.";
+  $message2 = "Your order details are shown below for your reference:";
+  $support_phone = "+1 650 666 3193";
+  $order_number = $order->order_number;
+  $order_date = date('M d, Y', $order->created);
+  $order_total = commerce_currency_format($order->commerce_order_total[$ln][0]['amount'], 'USD');
+  $shipping_name = $name;
+
+  $to = $order->mail . ',' . variable_get('email_notifications_recipient', '');
+  $subject = "site Order #$order_number";
+
+  $body = theme('site_order_mail_body', [
+    'title' => $title,
+    'name' => $name,
+    'salutation' => $salutation,
+    'message1' => $message1,
+    'message2' => $message2,
+    'support_email' => 'support@site.com',
+    'support_phone' => $support_phone,
+    'order_number' => $order_number,
+    'order_date' => $order_date,
+    'order_total' => $order_total,
+    'shipping_name' => $shipping_name,
+    'products' => $products,
+    'shipping' => $shipping,
+    'tax' => $tax,
+    'address1' => $address1,
+    'address2' => $address2,
+    'city' => $city,
+    'country' => $country,
+    'postal_code' => $postal_code,
+  ]);
+
+  $params = [
+    'subject' => $subject,
+    'body' => $body
+  ];
+
+  drupal_mail('site_specific', 'site_order', $to, language_default(), $params);
+}
+
+/**
+ * Send an order status update based on the order status being set.
+ *
+ * @param $order
+ *  The order object.
+ */
+function site_specific_send_order_status_update($order, $shipping_date = NULL, $invoice_number = NULL, $shipped_date = NULL, $boxes_trackings = NULL) {
+  $ln = LANGUAGE_NONE;
+
+  $title = "Order Status Update";
+  $support_phone = "+1 650 666 3193";
+  $order_number = $order->order_number;
+  $order_date = date('M d, Y', $order->created);
+  $order_total = commerce_currency_format($order->commerce_order_total[$ln][0]['amount'], 'USD');
+  $order_status = $order->status;
+
+  $to = $order->mail . ',' . variable_get('email_notifications_recipient', '');
+  $subject = "site Order #$order_number Status Update";
+  $variables = [
+    'title' => $title,
+    'support_email' => 'support@site.com',
+    'support_phone' => $support_phone,
+    'order_number' => $order_number,
+    'order_date' => $order_date,
+    'order_total' => $order_total,
+    'order_status' => $order_status,
+  ];
+
+  if ($shipping_date) {
+    $variables['shipping_date'] = $shipping_date;
+  }
+
+  if ($invoice_number) {
+    $variables['invoice_number'] = $invoice_number;
+  }
+
+  if ($shipped_date) {
+    $variables['shipped_date'] = $shipped_date;
+  }
+
+  if ($boxes_trackings) {
+    $variables['boxes'] = $boxes_trackings['boxes'];
+    $variables['trackings'] = $boxes_trackings['trackings'];
+  }
+
+  $body = theme('site_order_status_mail_body', $variables);
+
+  $params = [
+    'subject' => $subject,
+    'body' => $body
+  ];
+
+  if (variable_get('environment_mode', '') == 'local') {
+    return;
+  }
+
+  drupal_mail('site_specific', 'site_order', $to, language_default(), $params);
+}
+
+/**
+ * Generate a new random password for the requesting user.
+ */
+function site_specific_update_account_password($account) {
+  $chars = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789!@#$%^&*()_-=+;:,.?";
+  $new_random_password = substr(str_shuffle($chars), 0, 8);
+  $account->pass = hash('sha384', $new_random_password);
+
+  user_save(
+    (object) array('uid' => $account->uid),
+    (array) $account
+  );
+
+  return $new_random_password;
+}
+
+/**
+ * Upload a file order to Honest Green FTP server.
+ *
+ * @param $order
+ *  The order object.
+ * @param $products
+ *  An array of products object.
+ */
+function site_specific_upload_file_order($order, $products) {
+  global $base_url;
+
+  $customer = site_specific_get_customer_information($order);
+  $name = $customer['first_name'] . ' ' . $customer['last_name'];
+  $address1 = $customer['address1'];
+  $address2 = $customer['address2'];
+  $city = $customer['city'];
+  $country = $customer['country'];
+  $postal_code = $customer['postal_code'];
+  $state = get_state_code($postal_code);
+
+  $order_number = $order->order_number;
+  $order_count = 1;
+  $type = 'FIL';
+  $ship_code = 'A';
+  $store_number = '5001';
+  $ship_to_name = $name;
+  $customer_id = '40829';
+  $counter = 1;
+  $txt = "";
+  $txt .= "1\n";
+  $txt .= "$customer_id,,$order_number,$type\n";
+  $txt .= "$name,$address1,$address2,$city,$state,$postal_code,,$ship_code,$store_number\n";
+
+  foreach ($products as $key => $product) {
+    if (is_array($product)) {
+      $quantity = $product['quantity'];
+      $unfi = $product['unfi'];
+      $txt .= "$unfi,,$quantity,,,\n";
+    }
+  }
+
+  $txt .= "***EOF***\n";
+
+  $path = 'public://site-orders/';
+  $filename = 'site-order-' . $order_number . '.txt';
+
+  if (file_prepare_directory($path, FILE_CREATE_DIRECTORY)) {
+    file_put_contents($path . $filename, $txt);
+    flog_it("[site_specific]: Order file created at $path$filename");
+  }
+  else {
+    flog_it("[site_specific]: Unable to create order file $path$filename");
+  }
+
+  upload_to_ftp($order_number);
+
+  return;
+}
+
+/**
+ * Helper to parse the tax jason and get the equivalent state code based from the given postal code.
+ *
+ * @param $postal_code
+ *  The state postal code.
+ */
+function get_state_code($postal_code) {
+  $json_file = file_get_contents(drupal_get_path('module', 'site_rest_api') . '/resources/taxes.json');
+  $decode = json_decode($json_file);
+
+  foreach ($decode->data as $key => $tax) {
+    if ($tax->zipCode == $postal_code) {
+      return $tax->stateCode;
+    }
+  }
+}
+
+/**
+ * Helper for uploading the file to ftp server.
+ */
+function upload_to_ftp($order_number) {
+  $ftp_server = variable_get('unfi_ftp_settings_host', '');
+  $username = variable_get('unfi_ftp_settings_username', '');
+  $password = variable_get('unfi_ftp_settings_password', '');
+
+  $ftp_conn = ftp_connect($ftp_server) or die("Could not connect to $ftp_server");
+  $login = ftp_login($ftp_conn, $username, $password);
+  ftp_pasv($ftp_conn, TRUE);
+
+  $filename = "site-order-" . $order_number . ".txt";
+  $local_filepath = "public://site-orders/" . $filename;
+
+  try {
+    ftp_chdir($ftp_conn, 'Orders');
+
+    if (ftp_put($ftp_conn, $filename, $local_filepath, FTP_BINARY)) {
+      flog_it("[site_specific]: Successfully uploaded $filename");
+    }
+    else {
+      flog_it("[site_specific]: Error uploading $filename");
+    }
+  }
+  catch (Exception $e) {
+    flog_it($e->getMessage(), "[site_specific]: Error uploading $filename");
+  }
+
+  ftp_close($ftp_conn);
+
+  return;
+}
+
+/**
+ * Helper function to scan the UNFI FTP server for confirmed orders.
+ *
+ * @param $ftp_conn
+ *  The instantiated ftp connection stream.
+ * @param $content
+ *  An array containing the contents of an FTP directory.
+ * @param $orders
+ *  An array of orders that are pending or processing in status.
+ * @param $username
+ *  The UNFI ftp username.
+ */
+function site_specific_check_order_for_processing($ftp_conn, $content, $orders, $username) {
+  $inside = ftp_nlist($ftp_conn, $content);
+
+  if (count($inside) > 0) {
+    foreach ($orders as $order) {
+      $order_number = $order->order_number;
+      $confirmation_name = $username . '.O' . $order_number . 'A.txt';
+
+      if (array_keys($inside, $confirmation_name)) {
+        if (empty($order->data['email_confirmations'])) {
+          flog_it($confirmation_name, "[site_specific]: Confirmation name has a matched file. Updating the order #$order_number to Processing.");
+
+          $order->data['email_confirmations'] = TRUE;
+          commerce_order_status_update($order, 'processing', TRUE, 'Order Processing');
+          commerce_order_save($order);
+          site_specific_send_order_status_update($order);
+        }
+        else {
+          flog_it("[site_specific]: Order #$order_number email confirmation is already set to TRUE");
+        }
+      }
+    }
+  }
+}
+
+/**
+ * Helper function to scan the UNFI FTP server for orders ready for shipping.
+ *
+ * @param $ftp_conn
+ *  The instantiated ftp connection stream.
+ * @param $content
+ *  An array containing the contents of an FTP directory.
+ * @param $orders
+ *  An array of orders that are pending or processing in status.
+ * @param $username
+ *  The UNFI ftp username.
+ */
+function site_specific_check_order_for_shipping($ftp_conn, $content, $orders, $username) {
+  $inside = ftp_nlist($ftp_conn, $content);
+
+  if (count($inside) > 0) {
+    foreach ($orders as $order) {
+      $order_number = $order->order_number;
+      $invoice_name = $username . '.S' . $order_number . 'A.txt';
+
+      if (array_keys($inside, $invoice_name)) {
+        if (empty($order->data['email_invoice'])) {
+          flog_it($invoice_name, "[site_specific]: Invoice name has a matched file.");
+          $local_filepath = "public://site-invoice/" . $invoice_name;
+
+          ftp_chdir($ftp_conn, 'Shipping');
+          $invoice_file = ftp_get($ftp_conn, $local_filepath, $invoice_name, FTP_BINARY);
+
+          if ($invoice_file) {
+            flog_it("[site_specific]: Invoice file $invoice_name is successfully downloaded to $local_filepath");
+            $order->data['email_invoice'] = TRUE;
+            commerce_order_save($order);
+
+            $invoice_number = site_specific_parse_order_invoice_number($local_filepath);
+            $shipping_date = site_specific_parse_order_shipping_date($local_filepath);
+
+            site_specific_send_order_status_update($order, $shipping_date, $invoice_number);
+          }
+          else {
+            flog_it("[site_specific]: Cannot download the invoice file $invoice_name to $local_filepath");
+          }
+        }
+        else {
+          flog_it("[site_specific]: Order #$order_number email invoice is already set to TRUE");
+        }
+      }
+    }
+  }
+}
+
+/**
+ * Helper function to scan the UNFI FTP server for orders in tracking.
+ *
+ * @param $ftp_conn
+ *  The instantiated ftp connection stream.
+ * @param $content
+ *  An array containing the contents of an FTP directory.
+ * @param $orders
+ *  An array of orders that are pending or processing in status.
+ * @param $username
+ *  The UNFI ftp username.
+ */
+function site_specific_check_order_for_tracking($ftp_conn, $content, $orders, $username) {
+  $inside = ftp_nlist($ftp_conn, $content);
+
+  if (count($inside) > 0) {
+    foreach ($orders as $order) {
+      $order_number = $order->order_number;
+      $tracking_name = $username . '.T' . $order_number . 'S.txt';
+
+      if (array_keys($inside, $tracking_name)) {
+        if (empty($order->data['email_tracking'])) {
+          flog_it($tracking_name, "[site_specific]: Tracking name has a matched file.");
+          $local_filepath = "public://site-tracking/" . $tracking_name;
+
+          ftp_chdir($ftp_conn, 'Tracking');
+          $tracking_file = ftp_get($ftp_conn, $local_filepath, $tracking_name, FTP_BINARY);
+
+          if ($tracking_file) {
+            flog_it("[site_specific]: Tracking file $tracking_name is successfully downloaded to $local_filepath");
+            $order->data['email_tracking'] = TRUE;
+            commerce_order_status_update($order, 'shipped', TRUE, 'Order Shipped');
+            commerce_order_save($order);
+
+            $invoice_number = site_specific_parse_order_invoice_number($local_filepath);
+            $shipped_date = site_specific_parse_order_shipped_date($local_filepath);
+            $boxes_trackings = site_specific_parse_order_trackings($local_filepath);
+
+            site_specific_send_order_status_update($order, NULL, $invoice_number, $shipped_date, $boxes_trackings);
+          }
+          else {
+            flog_it("[site_specific]: Cannot download the tracking file $tracking_name to $local_filepath");
+          }
+        }
+        else {
+          flog_it("[site_specific]: Order #$order_number email tracking is already set to TRUE");
+        }
+      }
+    }
+  }
+}
+
+/**
+ * Helper function for parsing the shipping date from the Invoice file.
+ *
+ * @param $local_filepath
+ *  The path of the invoice file and it's file name included.
+ */
+function site_specific_parse_order_shipping_date($local_filepath) {
+  $invoice_file = file_get_contents($local_filepath);
+  $rows = explode("\n", $invoice_file);
+  $shipping_row = $rows[0];
+  $shipping_columns = explode(',', $shipping_row);
+  end($shipping_columns);
+  $shipping_date = $shipping_columns[key($shipping_columns)];
+
+  $chunks = explode('/', $shipping_date);
+
+  if (count($chunks)) {
+    return str_replace('"', '', $shipping_date);
+  }
+
+  return FALSE;
+}
+
+/**
+ * Helper function for parsing the shipped date from the Tracking file.
+ *
+ * @param $local_filepath
+ *  The path of the tracking file and it's file name included.
+ */
+function site_specific_parse_order_shipped_date($local_filepath) {
+  $tracking_file = file_get_contents($local_filepath);
+  $rows = explode("\n", $tracking_file);
+  $tracking_row = $rows[0];
+  $tracking_columns = explode(',', $tracking_row);
+  end($tracking_columns);
+  $shipped_date = $tracking_columns[key($tracking_columns)];
+
+  $chunks = explode('/', $shipped_date);
+
+  if (count($chunks)) {
+    return str_replace('"', '', $shipped_date);
+  }
+
+  return FALSE;
+}
+
+/**
+ * Helper function for parsing the shipped date from the Tracking file.
+ *
+ * @param $local_filepath
+ *  The path of the tracking file and it's file name included.
+ */
+function site_specific_parse_order_trackings($local_filepath) {
+  $tracking_file = file_get_contents($local_filepath);
+  $rows = explode("\n", $tracking_file);
+  $tracking_row = $rows[1];
+  $tracking_columns = explode(',', $tracking_row);
+  $boxes = $tracking_columns[0];
+  array_splice($tracking_columns, 0, 1);
+
+  return [
+    'boxes' => $boxes,
+    'trackings' => implode(', ', $tracking_columns),
+  ];
+}
+
+/**
+ * Helper function for parsing the invoice number from the Invoice file.
+ *
+ * @param $local_filepath
+ *  The path of the invoice file and it's file name included.
+ */
+function site_specific_parse_order_invoice_number($local_filepath) {
+  $invoice_file = file_get_contents($local_filepath);
+  $rows = explode("\n", $invoice_file);
+  $invoice_row = $rows[0];
+  $invoice_columns = explode(',', $invoice_row);
+  $invoice_number = $invoice_columns[0];
+
+  if ($invoice_number) {
+    return $invoice_number;
+  }
+
+  return FALSE;
+}
